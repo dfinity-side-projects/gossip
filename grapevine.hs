@@ -7,6 +7,7 @@ import Control.Concurrent hiding (readChan)
 import Control.Concurrent.BoundedChan
 import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
+import Data.Char
 import Data.IP
 import Data.List.Split
 import qualified Data.Map.Strict as M
@@ -88,14 +89,25 @@ readPeerage m = Just $ M.map f m where
     [ip4, port] = splitOn ":" s
     host = toHostAddress $ read ip4
 
+report :: Handle -> ByteString -> IO ()
+report h s = void $ B.hPut h s
+
 wire :: Handle -> ByteString -> IO ()
-wire h s = B.hPut h s
+wire h s = do
+  let n = B.length s
+  when (n > 2 * 1024 * 1024) $ ioError $ userError "artifact too large!"
+  let ds = map (chr . (`mod` 256) . div n) $ (256^) <$> [3, 2, 1, 0 :: Int]
+  forM_ ds $ hPutChar h
+  B.hPut h s
+  status <- B.hGet h 4096
+  when (status /= "OK") $ putStrLn $ "BUG: " ++  show status
 
 procure :: Handle -> IO ByteString
-procure h = B.hGet h $ 1024 * 1024
-
-report :: Handle -> ByteString -> IO ()
-report h s = pure () --  void $ B.hPut h s
+procure h = do
+  ds <- unpack <$> B.hGet h 4
+  let n = sum $ zipWith (*) (ord <$> ds) $ (256^) <$> [3, 2, 1, 0 :: Int]
+  when (n > 2 * 1024 * 1024) $ ioError $ userError "artifact too large!"
+  B.hGet h n
 
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = do
@@ -122,6 +134,7 @@ nobleLoop gv = do
           Just _ -> do
             putMVar (seenTable gv) seen
             putStrLn $ "old: " ++ show h
+            report han "OK"
       _ -> report han "E_BADTYPE"
     hClose han
   nobleLoop gv
