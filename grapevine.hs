@@ -2,20 +2,20 @@
 module Grapevine (Grapevine, grapevineKing, grapevineNoble, publish, yell, hear) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
+import qualified Data.ByteString.Char8 as B
 import Control.Concurrent hiding (readChan)
 import Control.Concurrent.BoundedChan
 import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
 import Data.IP
 import Data.List.Split
-import Data.Maybe
 import qualified Data.Map.Strict as M
 import Network.Socket hiding (send, recv)
 import Network.Socket.ByteString
-import System.Environment
+import System.IO
 import Text.Read
- 
-data Message = TestGo | Hello String | Peerage (M.Map String String) | Blob ByteString deriving (Show, Read)
+
+data Message = Hello String | Peerage (M.Map String String) | Blob ByteString deriving (Show, Read)
 
 data Grapevine = Grapevine {
   myNetName :: String,
@@ -39,7 +39,7 @@ newGrapevine name port = do
   inSock <- socket AF_INET Stream 0
   setSocketOption inSock ReusePort 1
   bind inSock sockAddr
-  listen inSock 2
+  listen inSock 128
   inPort <- socketPort inSock
   bc <- newBoundedChan 20
   st <- newMVar M.empty
@@ -47,8 +47,6 @@ newGrapevine name port = do
 
 grapevineKing :: String -> Int -> IO Grapevine
 grapevineKing name port = do
-  let
-    sockAddr = SockAddrInet (fromIntegral port) iNADDR_ANY
   gv <- newGrapevine name port
   putStrLn $ "PORT = " ++ show (myPort gv)
   void $ forkIO $ kingLoop gv
@@ -62,13 +60,13 @@ grapevineNoble king name port = do
   addrInfo <- getAddrInfo Nothing (Just host) (Just seedPort)
   outSock <- reuseMyPort gv
   connect outSock (addrAddress $ head addrInfo)
-  send outSock $ pack $ show $ Hello name
+  void $ send outSock $ pack $ show $ Hello name
   bs <- recv outSock 4096
-  print ("GOT", bs)
+  when (bs /= "OK") $ ioError $ userError "The King is dead?"
   close outSock
   void $ forkIO $ nobleLoop gv
   pure gv
-  
+
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = do
   (sock, peer) <- accept $ mySock gv
@@ -76,14 +74,11 @@ kingLoop gv = do
     putStrLn $ show peer
     bs <- recv sock 4096
     case readMaybe $ unpack bs of
-      Just TestGo -> do
-        publish gv
       Just (Hello s) -> do
-        -- TODO: Use our IP if address is localhost.
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
         void $ send sock "OK"
-      _ -> void $ send sock "ERROR"
+      _ -> void $ send sock "E_BADHELLO"
     close sock
   kingLoop gv
 
@@ -93,32 +88,42 @@ readPeerage m = Just $ M.map f m where
     [ip4, port] = splitOn ":" s
     host = toHostAddress $ read ip4
 
+wire :: Handle -> ByteString -> IO ()
+wire h s = B.hPut h s
+
+procure :: Handle -> IO ByteString
+procure h = B.hGet h $ 1024 * 1024
+
+report :: Handle -> ByteString -> IO ()
+report h s = pure () --  void $ B.hPut h s
+
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = do
-  (sock, peer) <- accept $ mySock gv
+  (sock, _) <- accept $ mySock gv
   void $ forkIO $ do
-    bs <- recv sock 4096
+    han <- socketToHandle sock ReadWriteMode
+    bs <- procure han
     case readMaybe $ unpack bs of
       Just (Peerage m) -> do
         case readPeerage m of
-          Nothing -> void $ send sock "ERROR"
+          Nothing -> report han "E_BADPEERAGE"
           Just ps -> do
             void $ swapMVar (peerage gv) ps
-            void $ send sock "OK"
+            print =<< readMVar (peerage gv)
+            report han "OK"
       Just (Blob b) -> do
-        print ("BLOB", b)
         seen <- takeMVar $ seenTable gv
         let h = SHA256.hash b
         case M.lookup h seen of
           Nothing -> do
             putMVar (seenTable gv) $ M.insert h [] seen
             status <- tryWriteChan (blobChan gv) b
-            void $ send sock $ if status then "OK" else "FULL"
+            report han $ if status then "OK" else "E_FULL"
           Just _ -> do
             putMVar (seenTable gv) seen
             putStrLn $ "old: " ++ show h
-      _ -> void $ send sock "ERROR"
-    close sock
+      _ -> report han "E_BADTYPE"
+    hClose han
   nobleLoop gv
 
 publish :: Grapevine -> IO ()
@@ -127,9 +132,9 @@ publish gv = do
   forM_ (M.elems ps) $ \sock -> do
     tmpSock <- socket AF_INET Stream 0
     connect tmpSock sock
-    send tmpSock $ pack $ show $ Peerage $ M.map show ps 
-    bs <- recv tmpSock 4096
-    print ("RCPT", bs)
+    h <- socketToHandle tmpSock ReadWriteMode
+    wire h $ pack $ show $ Peerage $ M.map show ps
+    hClose h
   print ps
 
 yell :: Grapevine -> ByteString -> IO ()
@@ -140,9 +145,9 @@ yell gv b = do
   forM_ (M.assocs ps) $ \(s, sock) -> when (s /= myNetName gv) $ do
     tmpSock <- socket AF_INET Stream 0
     connect tmpSock sock
-    send tmpSock $ pack $ show $ Blob b
-    bs <- recv tmpSock 4096
-    print ("RCPT", bs)
+    h <- socketToHandle tmpSock ReadWriteMode
+    wire h $ pack $ show $ Blob b
+    hClose h
 
 hear :: Grapevine -> IO ByteString
 hear gv = readChan $ blobChan gv
