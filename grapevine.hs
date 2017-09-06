@@ -5,6 +5,7 @@ import Data.ByteString.Char8 (ByteString, pack, unpack)
 import Control.Concurrent hiding (readChan)
 import Control.Concurrent.BoundedChan
 import Control.Monad
+import qualified Crypto.Hash.SHA256 as SHA256
 import Data.IP
 import Data.List.Split
 import Data.Maybe
@@ -21,7 +22,8 @@ data Grapevine = Grapevine {
   myPort :: PortNumber,
   mySock :: Socket,
   blobChan :: BoundedChan ByteString,
-  peerage :: MVar (M.Map String SockAddr)
+  peerage :: MVar (M.Map String SockAddr),
+  seenTable :: MVar (M.Map ByteString [Int])
 }
 
 reuseMyPort :: Grapevine -> IO Socket
@@ -40,7 +42,8 @@ newGrapevine name port = do
   listen inSock 2
   inPort <- socketPort inSock
   bc <- newBoundedChan 20
-  Grapevine name inPort inSock bc <$> newMVar M.empty
+  st <- newMVar M.empty
+  Grapevine name inPort inSock bc st <$> newMVar M.empty
 
 grapevineKing :: String -> Int -> IO Grapevine
 grapevineKing name port = do
@@ -48,7 +51,7 @@ grapevineKing name port = do
     sockAddr = SockAddrInet (fromIntegral port) iNADDR_ANY
   gv <- newGrapevine name port
   putStrLn $ "PORT = " ++ show (myPort gv)
-  kingLoop gv
+  void $ forkIO $ kingLoop gv
   pure gv
 
 grapevineNoble :: String -> String -> Int -> IO Grapevine
@@ -63,21 +66,9 @@ grapevineNoble king name port = do
   bs <- recv outSock 4096
   print ("GOT", bs)
   close outSock
-  nobleLoop gv
+  void $ forkIO $ nobleLoop gv
   pure gv
   
-main :: IO ()
-main = do
-  envs <- getEnvironment
-  let
-    port = fromMaybe 0 $ readMaybe =<< lookup "PORT" envs
-    name = fromMaybe "foo" $ lookup "NAME" envs
-  args <- getArgs
-  void $ if null args then
-    grapevineKing name port
-  else
-    grapevineNoble (head args) name port
-
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = do
   (sock, peer) <- accept $ mySock gv
@@ -114,12 +105,18 @@ nobleLoop gv = do
           Just ps -> do
             void $ swapMVar (peerage gv) ps
             void $ send sock "OK"
-      Just TestGo -> do
-        yell gv "TEST BLOB"
       Just (Blob b) -> do
         print ("BLOB", b)
-        status <- tryWriteChan (blobChan gv) b
-        void $ send sock $ if status then "OK" else "FULL"
+        seen <- takeMVar $ seenTable gv
+        let h = SHA256.hash b
+        case M.lookup h seen of
+          Nothing -> do
+            putMVar (seenTable gv) $ M.insert h [] seen
+            status <- tryWriteChan (blobChan gv) b
+            void $ send sock $ if status then "OK" else "FULL"
+          Just _ -> do
+            putMVar (seenTable gv) seen
+            putStrLn $ "old: " ++ show h
       _ -> void $ send sock "ERROR"
     close sock
   nobleLoop gv
@@ -138,6 +135,8 @@ publish gv = do
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = do
   ps <- readMVar $ peerage gv
+  seen <- takeMVar $ seenTable gv
+  putMVar (seenTable gv) $ M.insert (SHA256.hash b) [] seen
   forM_ (M.assocs ps) $ \(s, sock) -> when (s /= myNetName gv) $ do
     tmpSock <- socket AF_INET Stream 0
     connect tmpSock sock
@@ -146,5 +145,4 @@ yell gv b = do
     print ("RCPT", bs)
 
 hear :: Grapevine -> IO ByteString
-hear gv = do
-  readChan $ blobChan gv
+hear gv = readChan $ blobChan gv
