@@ -13,6 +13,8 @@ import Data.IP
 import Data.List
 import Data.List.Split
 import qualified Data.Map.Strict as M
+import qualified Data.Set as Set
+import Data.Set (Set)
 import Network.Socket hiding (send, recv)
 import Network.Socket.ByteString
 import Safe
@@ -28,7 +30,7 @@ data Grapevine = Grapevine {
   blobChan :: BoundedChan ByteString,
   peerage :: MVar (M.Map String SockAddr),
   neighbours :: MVar [Handle],
-  seenTable :: MVar (M.Map ByteString [Int])
+  seenTables :: MVar (Set ByteString, Set ByteString)
 }
 
 reuseMyPort :: Grapevine -> IO Socket
@@ -49,7 +51,8 @@ newGrapevine royal name port = do
   bc <- newBoundedChan 128
   emptyPeerage <- newMVar M.empty
   emptyNeighbours <- newMVar []
-  Grapevine royal name inPort inSock bc emptyPeerage emptyNeighbours <$> newMVar M.empty
+  emptySeens <- newMVar (Set.empty, Set.empty)
+  pure $ Grapevine royal name inPort inSock bc emptyPeerage emptyNeighbours emptySeens
 
 grapevineKing :: String -> Int -> IO Grapevine
 grapevineKing name port = do
@@ -171,16 +174,21 @@ kautzIn :: Int -> Int -> Int -> [Int]
 kautzIn m n i = fromKautz m . (:s) <$> filter (/= head s) [0..m]
   where s = init $ toKautz m n i
 
+reportSighting :: Ord a => (Set a, Set a) -> a -> (Set a, Set a)
+reportSighting (seen, seen2) h = if Set.size seen == 1024
+  then (Set.singleton h, seen)
+  else (Set.insert h seen, seen2)
+
 process :: Grapevine -> ByteString -> IO ()
 process gv b = do
-  seen <- takeMVar $ seenTable gv
+  (seen, seen2) <- takeMVar $ seenTables gv
   let h = SHA256.hash b
-  case M.lookup h seen of
-    Nothing -> do
-      putMVar (seenTable gv) $ M.insert h [] seen
-      status <- tryWriteChan (blobChan gv) b
-      when (not status) $ putStrLn "FULL BUFFER"
-    Just _ -> putMVar (seenTable gv) seen
+  if Set.member h seen || Set.member h seen2 then
+    putMVar (seenTables gv) (seen, seen2)
+  else do
+    putMVar (seenTables gv) $ reportSighting (seen, seen2) h
+    status <- tryWriteChan (blobChan gv) b
+    when (not status) $ putStrLn "FULL BUFFER"
 
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = do
@@ -226,8 +234,8 @@ yell gv b = if isKing gv then do
       hClose h
   else do
     hs <- readMVar $ neighbours gv
-    seen <- takeMVar $ seenTable gv
-    putMVar (seenTable gv) $ M.insert (SHA256.hash b) [] seen
+    seens <- takeMVar $ seenTables gv
+    putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
     forConcurrently_ hs $ \h -> wire h b
 
 hear :: Grapevine -> IO ByteString
