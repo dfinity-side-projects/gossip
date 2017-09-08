@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, publish, yell, hear) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, publish, yell, hear) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -16,7 +16,6 @@ import qualified Data.Map.Strict as M
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Network.Socket hiding (send, recv)
-import Network.Socket.ByteString
 import Safe
 import System.IO
 
@@ -56,6 +55,9 @@ newGrapevine royal name port = do
   emptySeens <- newMVar (Set.empty, Set.empty)
   pure $ Grapevine royal name inPort inSock bc emptyPeerage emptyNeighbours emptySeens
 
+grapevinePort :: Grapevine -> PortNumber
+grapevinePort = myPort
+
 grapevineKing :: String -> Int -> IO Grapevine
 grapevineKing name port = do
   gv <- newGrapevine True name port
@@ -70,8 +72,11 @@ grapevineNoble king name port = do
   addrInfo <- getAddrInfo Nothing (Just host) (Just seedPort)
   outSock <- reuseMyPort gv
   connect outSock (addrAddress $ head addrInfo)
-  void $ send outSock $ pack $ show $ Hello name
-  close outSock
+  h <- socketToHandle outSock ReadWriteMode
+  wire h $ pack $ show $ Hello name
+  ok <- B.hGet h 2
+  putStrLn $ "STATUS: " ++ show ok
+  hClose h
   void $ forkIO $ nobleLoop gv
   pure gv
 
@@ -79,14 +84,16 @@ kingLoop :: Grapevine -> IO ()
 kingLoop gv = do
   (sock, peer) <- accept $ mySock gv
   void $ forkIO $ do
+    h <- socketToHandle sock ReadWriteMode
     putStrLn $ show peer
-    bs <- recv sock 4096
+    bs <- procure h
     case readMay $ unpack bs of
       Just (Hello s) -> do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
+        wire h "OK"
       _ -> putStrLn "BAD HELLO"
-    close sock
+    hClose h
   kingLoop gv
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
