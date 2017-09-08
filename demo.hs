@@ -2,7 +2,7 @@
 import Blaze.ByteString.Builder (fromByteString)
 import Control.Concurrent
 import Control.Monad
-import Data.ByteString.Char8 (pack, unpack)
+import Data.ByteString.Char8 (ByteString, pack, unpack)
 import Data.ByteString.Lazy (toStrict)
 import Network.Wai
 import Network.Wai.EventSource
@@ -24,7 +24,7 @@ main = do
     yell gv s
     writeChan sseCh $ ServerEvent Nothing Nothing [fromByteString s]
   user <- (concatMap (printf "%02x") . unpack) <$> getEntropy 16
-  nonce <- newMVar 0
+  nonce <- newMVar (0 :: Int)
   runEnv 3000 $ \req f -> let
     redir = redirTo ""
     redirTo s = f $ responseBuilder status303 [(hLocation, mconcat ["/", s])] $
@@ -49,6 +49,7 @@ main = do
       redir
     _ -> f $ responseLBS status501 [] "bad method\n"
 
+html :: ByteString
 html = mconcat [
   "<html><head><title>Chirp</title></head><body>",
   "<textarea id='log' readonly rows='25' cols='80'></textarea>",

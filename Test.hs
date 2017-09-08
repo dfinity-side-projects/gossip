@@ -6,7 +6,7 @@ import Kautz
 
 assertInverse :: (Int, Int) -> Assertion
 assertInverse (m, n) = s @=? (fromKautz m . toKautz m n <$> s)
-  where s = [0..(m+1)*m^n]
+  where s = [0..kautzSize m n - 1]
 
 main :: IO ()
 main = defaultMain $ testGroup "props" $

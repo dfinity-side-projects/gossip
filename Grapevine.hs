@@ -65,8 +65,7 @@ grapevineKing name port = do
 
 grapevineNoble :: String -> String -> Int -> IO Grapevine
 grapevineNoble king name port = do
-  let
-    [host, seedPort] = splitOn ":" king
+  let [host, seedPort] = splitOn ":" king
   gv <- newGrapevine False name port
   addrInfo <- getAddrInfo Nothing (Just host) (Just seedPort)
   outSock <- reuseMyPort gv
@@ -130,6 +129,10 @@ socialize gv = do
   else if n <= 80 then kautz gv ps 4 2
   else if n <= 108 then kautz gv ps 3 3
   else if n <= 150 then kautz gv ps 5 2
+  else if n <= 252 then kautz gv ps 6 2
+  else if n <= 320 then kautz gv ps 4 3
+  else if n <= 392 then kautz gv ps 7 2
+  else if n <= 750 then kautz gv ps 5 3
   else undefined
 
 kautz :: Grapevine -> M.Map String SockAddr -> Int -> Int -> IO ()
@@ -167,25 +170,20 @@ process gv b = do
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = do
   (sock, _) <- accept $ mySock gv
-  putStrLn "ACCEPT"
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
     bs <- procure h
     case readMay $ unpack bs of
-      Just Link -> do  -- TODO: Check sender `elem` kautzIn.
-        putStrLn "LINK"
-        forever $ process gv =<< procure h
+      Just Link -> forever $ process gv =<< procure h
       Just (Peerage m) -> do
-        putStrLn "PEERAGE"
         case readPeerage m of
           Nothing -> putStrLn "BAD PEERAGE"
           Just ps -> do
             void $ swapMVar (peerage gv) ps
             print =<< readMVar (peerage gv)
             socialize gv
-      Just (Blob b) -> do
-        putStrLn "BLOB"
-        process gv b
+            B.hPut h "OK"
+      Just (Blob b) -> process gv b
       _ -> putStrLn "BAD MESSAGE"
     hClose h
   nobleLoop gv
@@ -198,6 +196,8 @@ publish gv = do
     connect tmpSock sock
     h <- socketToHandle tmpSock ReadWriteMode
     wire h $ pack $ show $ Peerage $ M.map show ps
+    ok <- B.hGet h 2
+    putStrLn $ "STATUS: " ++ show ok
     hClose h
   print ps
 

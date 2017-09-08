@@ -1,4 +1,7 @@
-module Kautz (toKautz, fromKautz, kautzOut, kautzIn) where
+module Kautz (toKautz, fromKautz, kautzOut, kautzIn, kautzSize) where
+
+kautzSize :: Int -> Int -> Int
+kautzSize m n = (m+1)*m^n
 
 toKautz :: Int -> Int -> Int -> [Int]
 toKautz m n i = f [] n i where
