@@ -24,4 +24,3 @@ kautzOut m n i = fromKautz m . (t ++) . pure <$> filter (/= last t) [0..m]
 kautzIn :: Int -> Int -> Int -> [Int]
 kautzIn m n i = fromKautz m . (:s) <$> filter (/= head s) [0..m]
   where s = init $ toKautz m n i
-

@@ -91,7 +91,7 @@ kingLoop gv = do
       Just (Hello s) -> do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
-        wire h "OK"
+        B.hPut h $ pack "OK"
       _ -> putStrLn "BAD HELLO"
     hClose h
   kingLoop gv
@@ -140,6 +140,12 @@ socialize gv = do
   else if n <= 320 then kautz gv ps 4 3
   else if n <= 392 then kautz gv ps 7 2
   else if n <= 750 then kautz gv ps 5 3
+  else if n <= 1100 then kautz gv ps 10 2
+  else if n <= 1512 then kautz gv ps 6 3
+  else if n <= 2744 then kautz gv ps 7 3
+  else if n <= 4608 then kautz gv ps 8 3
+  else if n <= 7290 then kautz gv ps 9 3
+  else if n <= 11000 then kautz gv ps 10 3
   else undefined
 
 kautz :: Grapevine -> M.Map String SockAddr -> Int -> Int -> IO ()
