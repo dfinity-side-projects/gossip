@@ -1,3 +1,4 @@
+import Data.ByteString.Char8 (pack)
 import Control.Monad
 import Grapevine
 
@@ -7,3 +8,4 @@ main = do
   putStrLn "Press Enter to publish peerage."
   void $ getLine
   publish gv
+  yell gv $ pack "GO"

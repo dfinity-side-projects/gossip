@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, publish, yell, hear) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -13,6 +13,7 @@ import Data.IP
 import Data.List
 import Data.List.Split
 import qualified Data.Map.Strict as M
+import Data.Maybe
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Network.Socket hiding (send, recv)
@@ -21,15 +22,16 @@ import System.IO
 
 import Kautz
 
-data Message = Hello String | Peerage (M.Map String String) | Link | Blob ByteString deriving (Show, Read)
+data Message = Hello String | Peerage (M.Map String String) | Blob ByteString deriving (Show, Read)
 
 data Grapevine = Grapevine {
-  isKing :: Bool,
   myNetName :: String,
   myPort :: PortNumber,
   mySock :: Socket,
   blobChan :: BoundedChan ByteString,
   peerage :: MVar (M.Map String SockAddr),
+  kingHandle :: Maybe Handle,
+  mayStart :: MVar (),
   neighbours :: MVar [Handle],
   seenTables :: MVar (Set ByteString, Set ByteString)
 }
@@ -41,8 +43,8 @@ reuseMyPort gv = do
   bind outSock $ SockAddrInet (myPort gv) iNADDR_ANY
   pure outSock
 
-newGrapevine :: Bool -> String -> Int -> IO Grapevine
-newGrapevine royal name port = do
+newGrapevine :: String -> Int -> IO Grapevine
+newGrapevine name port = do
   let sockAddr = SockAddrInet (fromIntegral port) iNADDR_ANY
   inSock <- socket AF_INET Stream 0
   setSocketOption inSock ReusePort 1
@@ -53,14 +55,28 @@ newGrapevine royal name port = do
   emptyPeerage <- newMVar M.empty
   emptyNeighbours <- newMVar []
   emptySeens <- newMVar (Set.empty, Set.empty)
-  pure $ Grapevine royal name inPort inSock bc emptyPeerage emptyNeighbours emptySeens
+  notYet <- newEmptyMVar
+  pure $ Grapevine {
+    myNetName = name,
+    myPort = inPort,
+    mySock = inSock,
+    blobChan = bc,
+    peerage = emptyPeerage,
+    kingHandle = Nothing,
+    mayStart = notYet,
+    neighbours = emptyNeighbours,
+    seenTables = emptySeens
+  }
+
+grapevineSize :: Grapevine -> IO Int
+grapevineSize gv = M.size <$> readMVar (peerage gv)
 
 grapevinePort :: Grapevine -> PortNumber
 grapevinePort = myPort
 
 grapevineKing :: String -> Int -> IO Grapevine
 grapevineKing name port = do
-  gv <- newGrapevine True name port
+  gv <- newGrapevine name port
   putStrLn $ "PORT = " ++ show (myPort gv)
   void $ forkIO $ kingLoop gv
   pure gv
@@ -68,17 +84,43 @@ grapevineKing name port = do
 grapevineNoble :: String -> String -> Int -> IO Grapevine
 grapevineNoble king name port = do
   let [host, seedPort] = splitOn ":" king
-  gv <- newGrapevine False name port
+  gv0 <- newGrapevine name port
   addrInfo <- getAddrInfo Nothing (Just host) (Just seedPort)
-  outSock <- reuseMyPort gv
+  outSock <- reuseMyPort gv0
   connect outSock (addrAddress $ head addrInfo)
   h <- socketToHandle outSock ReadWriteMode
-  wire h $ pack $ show $ Hello name
-  ok <- B.hGet h 2
-  putStrLn $ "STATUS: " ++ show ok
-  hClose h
+  let gv = gv0 { kingHandle = Just h }
   void $ forkIO $ nobleLoop gv
+  void $ forkIO $ handshake gv
   pure gv
+
+handshake :: Grapevine -> IO ()
+handshake gv = do
+  let Just h = kingHandle gv
+  -- 1. Say Hello.
+  wire h $ pack $ show $ Hello $ myNetName gv
+  -- 2. Read Peerage.
+  Just (Peerage m) <- readMay . unpack <$> procure h
+  let Just ps = readPeerage m
+  void $ swapMVar (peerage gv) ps
+  print =<< readMVar (peerage gv)
+  socialize gv
+  -- 3. Say OK after meshing.
+  wire h "OK"
+  -- 4. First block should come from king.
+  Just (Blob b) <- readMay . unpack <$> procure h
+  process gv b
+  -- 5. Notify nobleLoop.
+  putMVar (mayStart gv) ()
+
+nobleLoop :: Grapevine -> IO ()
+nobleLoop gv = do
+  (sock, _) <- accept $ mySock gv
+  void $ forkIO $ do
+    h <- socketToHandle sock ReadWriteMode
+    readMVar $ mayStart gv
+    forever $ process gv =<< procure h
+  nobleLoop gv
 
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = do
@@ -91,9 +133,9 @@ kingLoop gv = do
       Just (Hello s) -> do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
-        B.hPut h $ pack "OK"
+        ns <- takeMVar $ neighbours gv
+        putMVar (neighbours gv) $ h:ns
       _ -> putStrLn "BAD HELLO"
-    hClose h
   kingLoop gv
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
@@ -127,7 +169,6 @@ socialize gv = do
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      wire h $ pack $ show Link
       pure h
     void $ swapMVar (neighbours gv) $ concat hs
   else if n <= 20 then kautz gv ps 4 1
@@ -160,7 +201,6 @@ kautz gv ps m n = let
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      wire h $ pack $ show Link
       pure h
     void $ swapMVar (neighbours gv) hs
 
@@ -180,49 +220,23 @@ process gv b = do
     status <- tryWriteChan (blobChan gv) b
     when (not status) $ putStrLn "FULL BUFFER"
 
-nobleLoop :: Grapevine -> IO ()
-nobleLoop gv = do
-  (sock, _) <- accept $ mySock gv
-  void $ forkIO $ do
-    h <- socketToHandle sock ReadWriteMode
-    bs <- procure h
-    case readMay $ unpack bs of
-      Just Link -> forever $ process gv =<< procure h
-      Just (Peerage m) -> do
-        case readPeerage m of
-          Nothing -> putStrLn "BAD PEERAGE"
-          Just ps -> do
-            void $ swapMVar (peerage gv) ps
-            print =<< readMVar (peerage gv)
-            socialize gv
-            B.hPut h "OK"
-      Just (Blob b) -> process gv b
-      _ -> putStrLn "BAD MESSAGE"
-    hClose h
-  nobleLoop gv
-
 publish :: Grapevine -> IO ()
 publish gv = do
   ps <- readMVar $ peerage gv
-  forConcurrently_ (M.elems ps) $ \sock -> do
-    tmpSock <- socket AF_INET Stream 0
-    connect tmpSock sock
-    h <- socketToHandle tmpSock ReadWriteMode
+  ns <- readMVar $ neighbours gv
+  forConcurrently_ ns $ \h -> do
     wire h $ pack $ show $ Peerage $ M.map show ps
-    ok <- B.hGet h 2
-    putStrLn $ "STATUS: " ++ show ok
-    hClose h
+    bs <- procure h
+    when (bs /= "OK") $ ioError $ userError "EXPECT OK"
   print ps
+
+isKing :: Grapevine -> Bool
+isKing gv = isNothing $ kingHandle gv
 
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv then do
-    ps <- readMVar $ peerage gv
-    forConcurrently_ (M.assocs ps) $ \(s, sock) -> when (s /= myNetName gv) $ do
-      tmpSock <- socket AF_INET Stream 0
-      connect tmpSock sock
-      h <- socketToHandle tmpSock ReadWriteMode
-      wire h $ pack $ show $ Blob b
-      hClose h
+    ns <- readMVar $ neighbours gv
+    forConcurrently_ ns $ \h -> wire h $ pack $ show $ Blob b
   else do
     hs <- readMVar $ neighbours gv
     seens <- takeMVar $ seenTables gv
