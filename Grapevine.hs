@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear, getStats, putStats) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear, getStats, putStats, htmlNetStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -34,6 +34,7 @@ data Grapevine = Grapevine {
   kingHandle :: Maybe Handle,
   mayStart :: MVar (),
   neighbours :: MVar (M.Map String Handle),
+  netStats :: MVar (M.Map String Int),
   seenTables :: MVar (Set ByteString, Set ByteString)
 }
 
@@ -56,6 +57,7 @@ newGrapevine name port = do
   sc <- newBoundedChan 64
   emptyPeerage <- newMVar M.empty
   emptyNeighbours <- newMVar M.empty
+  emptyNetStats <- newMVar M.empty
   emptySeens <- newMVar (Set.empty, Set.empty)
   notYet <- newEmptyMVar
   pure $ Grapevine {
@@ -68,6 +70,7 @@ newGrapevine name port = do
     kingHandle = Nothing,
     mayStart = notYet,
     neighbours = emptyNeighbours,
+    netStats = emptyNetStats,
     seenTables = emptySeens
   }
 
@@ -160,7 +163,7 @@ readPeerage m = Just $ M.map f m where
 wire :: Handle -> ByteString -> IO ()
 wire h s = do
   let n = B.length s
-  when (n > 2 * 1024 * 1024) $ ioError $ userError "artifact too large!"
+  when (n > 2 * 1024 * 1024) $ ioError $ userError "wire: artifact too large!"
   let ds = map (chr . (`mod` 256) . div n) $ (256^) <$> [3, 2, 1, 0 :: Int]
   forM_ ds $ hPutChar h
   B.hPut h s
@@ -170,7 +173,7 @@ procure :: Handle -> IO ByteString
 procure h = do
   ds <- unpack <$> B.hGet h 4
   let n = sum $ zipWith (*) (ord <$> ds) $ (256^) <$> [3, 2, 1, 0 :: Int]
-  when (n > 2 * 1024 * 1024) $ ioError $ userError "artifact too large!"
+  when (n > 2 * 1024 * 1024) $ ioError $ userError $ "BUG! Artifact too large: " ++ show n
   B.hGet h n
 
 socialize :: Grapevine -> IO ()
@@ -222,13 +225,20 @@ reportSighting (seen, seen2) h = if Set.size seen == 1024
   then (Set.singleton h, seen)
   else (Set.insert h seen, seen2)
 
+inc :: Grapevine -> String -> IO ()
+inc gv s = do
+  st <- takeMVar $ netStats gv
+  putMVar (netStats gv) $ M.insertWith (+) s 1 st
+
 process :: Grapevine -> ByteString -> IO ()
 process gv b = do
   (seen, seen2) <- takeMVar $ seenTables gv
   let h = SHA256.hash b
-  if Set.member h seen || Set.member h seen2 then
+  if Set.member h seen || Set.member h seen2 then do
+    inc gv "dup"
     putMVar (seenTables gv) (seen, seen2)
   else do
+    inc gv "in"
     putMVar (seenTables gv) $ reportSighting (seen, seen2) h
     status <- tryWriteChan (blobChan gv) b
     when (not status) $ putStrLn "FULL BUFFER"
@@ -247,7 +257,8 @@ isKing :: Grapevine -> Bool
 isKing gv = isNothing $ kingHandle gv
 
 yell :: Grapevine -> ByteString -> IO ()
-yell gv b = if isKing gv then do
+yell gv b = if isKing gv
+  then do
     ns <- readMVar $ neighbours gv
     forConcurrently_ (M.assocs ns) $ \(s, h) -> do
       wire h $ pack $ show $ Blob b
@@ -256,10 +267,18 @@ yell gv b = if isKing gv then do
         status <- tryWriteChan (statsChan gv) (s, stats)
         when (not status) $ putStrLn "channel full: STATS DROPPED"
   else do
+    inc gv "out"
     hs <- readMVar $ neighbours gv
     seens <- takeMVar $ seenTables gv
-    putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
     forConcurrently_ hs $ \h -> wire h b
+    putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
 hear gv = readChan $ blobChan gv
+
+htmlNetStats :: Grapevine -> IO String
+htmlNetStats gv = do
+  ns <- readMVar $ neighbours gv
+  ps <- readMVar $ peerage gv
+  t <- readMVar $ netStats gv
+  pure $ "downstream: " ++ (show $ catMaybes $ (`M.lookup` ps) <$> (M.keys ns) ) ++ "\n" ++ show t
