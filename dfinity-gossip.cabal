@@ -1,0 +1,61 @@
+name:          dfinity-gossip
+version:       0.1.0
+synopsis:      A simple gossip protocol 
+license:       AllRightsReserved
+copyright:     2017 String Labs, Inc.
+category:      Network
+build-type:    Simple
+cabal-version: >=1.10
+
+extra-source-files:
+  stack.yaml
+
+library
+  default-language:
+    Haskell2010
+  exposed-modules:
+    Grapevine
+    Kautz
+  build-depends:
+    BoundedChan,
+    async,
+    base,
+    bytestring,
+    containers,
+    cryptohash,
+    iproute,
+    network,
+    safe,
+    split
+  ghc-options:
+    -O2
+    -Wall
+    -threaded
+
+test-suite time-exts-unit-tests
+  default-language:
+    Haskell2010
+  type:
+    exitcode-stdio-1.0
+  main-is:
+    Test.hs
+  other-modules:
+    Grapevine
+    Kautz
+  build-depends:
+    BoundedChan,
+    async,
+    base,
+    bytestring,
+    containers,
+    cryptohash,
+    iproute,
+    network,
+    safe,
+    split,
+    tasty,
+    tasty-hunit
+  ghc-options:
+    -O2
+    -Wall
+    -threaded
