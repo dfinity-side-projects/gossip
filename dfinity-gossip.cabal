@@ -28,7 +28,9 @@ library
     safe,
     split
   ghc-options:
+    -O2
     -Wall
+    -threaded
 
 test-suite time-exts-unit-tests
   default-language:
@@ -54,4 +56,6 @@ test-suite time-exts-unit-tests
     tasty,
     tasty-hunit
   ghc-options:
+    -O2
     -Wall
+    -threaded
