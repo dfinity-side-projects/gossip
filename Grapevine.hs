@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear, getStats, putStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -29,10 +29,11 @@ data Grapevine = Grapevine {
   myPort :: PortNumber,
   mySock :: Socket,
   blobChan :: BoundedChan ByteString,
+  statsChan :: BoundedChan (String, ByteString),
   peerage :: MVar (M.Map String SockAddr),
   kingHandle :: Maybe Handle,
   mayStart :: MVar (),
-  neighbours :: MVar [Handle],
+  neighbours :: MVar (M.Map String Handle),
   seenTables :: MVar (Set ByteString, Set ByteString)
 }
 
@@ -52,8 +53,9 @@ newGrapevine name port = do
   listen inSock 128
   inPort <- socketPort inSock
   bc <- newBoundedChan 128
+  sc <- newBoundedChan 64
   emptyPeerage <- newMVar M.empty
-  emptyNeighbours <- newMVar []
+  emptyNeighbours <- newMVar M.empty
   emptySeens <- newMVar (Set.empty, Set.empty)
   notYet <- newEmptyMVar
   pure $ Grapevine {
@@ -61,12 +63,21 @@ newGrapevine name port = do
     myPort = inPort,
     mySock = inSock,
     blobChan = bc,
+    statsChan = sc,
     peerage = emptyPeerage,
     kingHandle = Nothing,
     mayStart = notYet,
     neighbours = emptyNeighbours,
     seenTables = emptySeens
   }
+
+putStats :: Grapevine -> ByteString -> IO ()
+putStats gv stats = do
+  status <- tryWriteChan (statsChan gv) ("", stats)
+  when (not status) $ putStrLn "channel full: STATS DROPPED"
+
+getStats :: Grapevine -> IO (String, ByteString)
+getStats gv = if not $ isKing gv then ioError $ userError "BUG: only King calls getStats" else readChan $ statsChan gv
 
 grapevineSize :: Grapevine -> IO Int
 grapevineSize gv = M.size <$> readMVar (peerage gv)
@@ -112,18 +123,21 @@ handshake gv = do
   process gv b
   -- 5. Notify nobleLoop.
   putMVar (mayStart gv) ()
+  -- 6. Send stats.
+  forever $ do
+    (_, bs) <- readChan $ statsChan gv
+    wire h bs
 
 nobleLoop :: Grapevine -> IO ()
-nobleLoop gv = do
+nobleLoop gv = forever $ do
   (sock, _) <- accept $ mySock gv
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
     readMVar $ mayStart gv
     forever $ process gv =<< procure h
-  nobleLoop gv
 
 kingLoop :: Grapevine -> IO ()
-kingLoop gv = do
+kingLoop gv = forever $ do
   (sock, peer) <- accept $ mySock gv
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
@@ -134,9 +148,8 @@ kingLoop gv = do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
         ns <- takeMVar $ neighbours gv
-        putMVar (neighbours gv) $ h:ns
+        putMVar (neighbours gv) $ M.insert s h ns
       _ -> putStrLn "BAD HELLO"
-  kingLoop gv
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
 readPeerage m = Just $ M.map f m where
@@ -165,12 +178,12 @@ socialize gv = do
   ps <- readMVar $ peerage gv
   let n = M.size ps
   if n < 10 then do
-    hs <- forConcurrently (M.assocs ps) $ \(s, sock) -> if s == myNetName gv then pure [] else pure <$> do
+    as <- forConcurrently (M.assocs ps) $ \(s, sock) -> if s == myNetName gv then pure [] else pure <$> do
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      pure h
-    void $ swapMVar (neighbours gv) $ concat hs
+      pure (s, h)
+    void $ swapMVar (neighbours gv) $ M.fromList $ concat as
   else if n <= 20 then kautz gv ps 4 1
   else if n <= 30 then kautz gv ps 5 1
   else if n <= 42 then kautz gv ps 6 1
@@ -197,12 +210,12 @@ kautz gv ps m n = let
   os = filter (/= i) $ nub $ (`mod` lim) <$> (kautzOut m n i ++ if lim + i < sz then kautzOut m n (lim + i) else [])
   in do
     when (sz > lim * 2) $ ioError $ userError "BUG! Kautz graph too big!"
-    hs <- forConcurrently ((`M.elemAt` ps) <$> os) $ \(_, sock) -> do
+    as <- forConcurrently ((`M.elemAt` ps) <$> os) $ \(s, sock) -> do
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      pure h
-    void $ swapMVar (neighbours gv) hs
+      pure (s, h)
+    void $ swapMVar (neighbours gv) $ M.fromList as
 
 reportSighting :: Ord a => (Set a, Set a) -> a -> (Set a, Set a)
 reportSighting (seen, seen2) h = if Set.size seen == 1024
@@ -236,7 +249,12 @@ isKing gv = isNothing $ kingHandle gv
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv then do
     ns <- readMVar $ neighbours gv
-    forConcurrently_ ns $ \h -> wire h $ pack $ show $ Blob b
+    forConcurrently_ (M.assocs ns) $ \(s, h) -> do
+      wire h $ pack $ show $ Blob b
+      void $ forkIO $ forever $ do
+        stats <- procure h
+        status <- tryWriteChan (statsChan gv) (s, stats)
+        when (not status) $ putStrLn "channel full: STATS DROPPED"
   else do
     hs <- readMVar $ neighbours gv
     seens <- takeMVar $ seenTables gv
