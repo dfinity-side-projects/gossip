@@ -6,6 +6,7 @@ import qualified Data.ByteString.Char8 as B
 import Control.Concurrent hiding (readChan)
 import Control.Concurrent.BoundedChan
 import Control.Concurrent.Async
+import Control.Exception
 import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
 import Data.Char
@@ -137,7 +138,12 @@ nobleLoop gv = forever $ do
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
     readMVar $ mayStart gv
-    forever $ process gv =<< procure h
+    inc gv ("in/" ++ show sock ++ "/connected")
+      -- ON DISCONNECT
+      --add gv (-1) ("in/" ++ show sock ++ "/connected")
+    forever $ do
+      process gv =<< procure h
+      inc gv ("in/" ++ show sock ++ "/msg")
 
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = forever $ do
@@ -172,9 +178,12 @@ wire h s = do
 procure :: Handle -> IO ByteString
 procure h = do
   ds <- unpack <$> B.hGet h 4
+  when (null ds) $ ioError $ userError $ "handle closed"
   let n = sum $ zipWith (*) (ord <$> ds) $ (256^) <$> [3, 2, 1, 0 :: Int]
   when (n > 2 * 1024 * 1024) $ ioError $ userError $ "BUG! Artifact too large: " ++ show n
-  B.hGet h n
+  r <- B.hGet h n
+  when (B.null r) $ ioError $ userError $ "handle closed"
+  pure r
 
 socialize :: Grapevine -> IO ()
 socialize gv = do
@@ -260,17 +269,22 @@ yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
   then do
     ns <- readMVar $ neighbours gv
-    forConcurrently_ (M.assocs ns) $ \(s, h) -> do
+    forM_ (M.assocs ns) $ \(s, h) -> void $ forkIO $ do
       wire h $ pack $ show $ Blob b
-      void $ forkIO $ forever $ do
+      handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
         stats <- procure h
         status <- tryWriteChan (statsChan gv) (s, stats)
-        when (not status) $ putStrLn "channel full: STATS DROPPED"
+        when (not status) $ do
+          inc gv "statsdrop"
+          putStrLn "king: STATS DROPPED"
   else do
     inc gv "out"
-    hs <- readMVar $ neighbours gv
+    ns <- readMVar $ neighbours gv
     seens <- takeMVar $ seenTables gv
-    forConcurrently_ hs $ \h -> wire h b
+    forConcurrently_ (M.assocs ns) $ \(s, h) -> catch (wire h b) $ \e -> do
+      putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+      ns1 <- takeMVar $ neighbours gv
+      putMVar (neighbours gv) $ M.delete s ns1
     putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
@@ -281,4 +295,8 @@ htmlNetStats gv = do
   ns <- readMVar $ neighbours gv
   ps <- readMVar $ peerage gv
   t <- readMVar $ netStats gv
-  pure $ "downstream: " ++ (show $ catMaybes $ (`M.lookup` ps) <$> (M.keys ns) ) ++ "\n" ++ show t
+  pure $ concat
+    [ "out-neighbours:\n"
+    , (unlines $ map show $ catMaybes $ (`M.lookup` ps) <$> (M.keys ns)) ++ "\n"
+    , unlines $ show <$> M.assocs t
+    ]
