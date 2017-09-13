@@ -54,7 +54,7 @@ newGrapevine name port = do
   bind inSock sockAddr
   listen inSock 128
   inPort <- socketPort inSock
-  bc <- newBoundedChan 128
+  bc <- newBoundedChan 1024
   sc <- newBoundedChan 64
   emptyPeerage <- newMVar M.empty
   emptyNeighbours <- newMVar M.empty
@@ -134,16 +134,18 @@ handshake gv = do
 
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = forever $ do
-  (sock, _) <- accept $ mySock gv
+  (sock, peer) <- accept $ mySock gv
+  let
+    discon e = do
+      add gv (-1) ("in/" ++ show sock ++ "/connected")
+      putStrLn $ "DISCONNECT: " ++ show peer ++ ": " ++ show (e :: SomeException)
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
     readMVar $ mayStart gv
-    inc gv ("in/" ++ show sock ++ "/connected")
-      -- ON DISCONNECT
-      --add gv (-1) ("in/" ++ show sock ++ "/connected")
-    forever $ do
+    inc gv ("in/" ++ show peer ++ "/connected")
+    handle discon $ forever $ do
       process gv =<< procure h
-      inc gv ("in/" ++ show sock ++ "/msg")
+      inc gv ("in/" ++ show peer ++ "/msg")
 
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = forever $ do
@@ -234,10 +236,13 @@ reportSighting (seen, seen2) h = if Set.size seen == 1024
   then (Set.singleton h, seen)
   else (Set.insert h seen, seen2)
 
-inc :: Grapevine -> String -> IO ()
-inc gv s = do
+add :: Grapevine -> Int -> String -> IO ()
+add gv n s = do
   st <- takeMVar $ netStats gv
-  putMVar (netStats gv) $ M.insertWith (+) s 1 st
+  putMVar (netStats gv) $! M.insertWith (+) s n st
+
+inc :: Grapevine -> String -> IO ()
+inc gv s = add gv 1 s
 
 process :: Grapevine -> ByteString -> IO ()
 process gv b = do
@@ -250,7 +255,11 @@ process gv b = do
     inc gv "in"
     putMVar (seenTables gv) $ reportSighting (seen, seen2) h
     status <- tryWriteChan (blobChan gv) b
-    when (not status) $ putStrLn "FULL BUFFER"
+    if status then do
+      inc gv "inqueue"
+    else do
+      inc gv "indropped"
+      putStrLn "FULL BUFFER"
 
 publish :: Grapevine -> IO ()
 publish gv = do
@@ -288,7 +297,10 @@ yell gv b = if isKing gv
     putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
-hear gv = readChan $ blobChan gv
+hear gv = do
+  r <- readChan $ blobChan gv
+  add gv (-1) "inqueue"
+  pure r
 
 htmlNetStats :: Grapevine -> IO String
 htmlNetStats gv = do
