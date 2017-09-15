@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, publish, yell, hear, getStats, putStats, htmlNetStats) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, grapevineTable, publish, yell, hear, getStats, putStats, htmlNetStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -36,7 +36,7 @@ data Grapevine = Grapevine {
   mayStart :: MVar (),
   neighbours :: MVar (M.Map String Handle),
   netStats :: MVar (M.Map String Int),
-  seenTables :: MVar (Set ByteString, Set ByteString)
+  seenTables :: MVar [Set ByteString]
 }
 
 reuseMyPort :: Grapevine -> IO Socket
@@ -54,12 +54,12 @@ newGrapevine name port = do
   bind inSock sockAddr
   listen inSock 128
   inPort <- socketPort inSock
-  bc <- newBoundedChan 1024
+  bc <- newBoundedChan 16384
   sc <- newBoundedChan 64
   emptyPeerage <- newMVar M.empty
   emptyNeighbours <- newMVar M.empty
   emptyNetStats <- newMVar M.empty
-  emptySeens <- newMVar (Set.empty, Set.empty)
+  emptySeens <- newMVar $ replicate 3 Set.empty
   notYet <- newEmptyMVar
   pure $ Grapevine {
     myNetName = name,
@@ -208,7 +208,8 @@ socialize gv = do
   else if n <= 320 then kautz gv ps 4 3
   else if n <= 392 then kautz gv ps 7 2
   else if n <= 750 then kautz gv ps 5 3
-  else if n <= 1100 then kautz gv ps 10 2
+  else if n <= 972 then kautz gv ps 3 5
+  --else if n <= 1100 then kautz gv ps 10 2
   else if n <= 1512 then kautz gv ps 6 3
   else if n <= 2744 then kautz gv ps 7 3
   else if n <= 4608 then kautz gv ps 8 3
@@ -231,10 +232,11 @@ kautz gv ps m n = let
       pure (s, h)
     void $ swapMVar (neighbours gv) $ M.fromList as
 
-reportSighting :: Ord a => (Set a, Set a) -> a -> (Set a, Set a)
-reportSighting (seen, seen2) h = if Set.size seen == 1024
-  then (Set.singleton h, seen)
-  else (Set.insert h seen, seen2)
+reportSighting :: Ord a => [Set a] -> a -> [Set a]
+reportSighting seens@(a:as) h = if Set.size a == 1024
+  then Set.singleton h : init seens
+  else Set.insert h a : as
+reportSighting [] _ = error "BUG!"
 
 add :: Grapevine -> Int -> String -> IO ()
 add gv n s = do
@@ -246,14 +248,14 @@ inc gv s = add gv 1 s
 
 process :: Grapevine -> ByteString -> IO ()
 process gv b = do
-  (seen, seen2) <- takeMVar $ seenTables gv
+  seens <- takeMVar $ seenTables gv
   let h = SHA256.hash b
-  if Set.member h seen || Set.member h seen2 then do
+  if any (Set.member h) seens then do
     inc gv "dup"
-    putMVar (seenTables gv) (seen, seen2)
+    putMVar (seenTables gv) seens
   else do
     inc gv "in"
-    putMVar (seenTables gv) $ reportSighting (seen, seen2) h
+    putMVar (seenTables gv) $ reportSighting seens h
     status <- tryWriteChan (blobChan gv) b
     if status then do
       inc gv "inqueue"
@@ -278,11 +280,12 @@ yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
   then do
     ns <- readMVar $ neighbours gv
+    ps <- readMVar $ peerage gv
     forM_ (M.assocs ns) $ \(s, h) -> void $ forkIO $ do
       wire h $ pack $ show $ Blob b
       handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
         stats <- procure h
-        status <- tryWriteChan (statsChan gv) (s, stats)
+        status <- tryWriteChan (statsChan gv) (show $ ps M.! s, stats)
         when (not status) $ do
           inc gv "statsdrop"
           putStrLn "king: STATS DROPPED"
@@ -312,3 +315,6 @@ htmlNetStats gv = do
     , (unlines $ map show $ catMaybes $ (`M.lookup` ps) <$> (M.keys ns)) ++ "\n"
     , unlines $ show <$> M.assocs t
     ]
+
+grapevineTable :: Grapevine -> IO (M.Map String Int)
+grapevineTable gv = readMVar $ netStats gv
