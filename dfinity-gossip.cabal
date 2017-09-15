@@ -30,7 +30,6 @@ library
   ghc-options:
     -O2
     -Wall
-    -threaded
 
 test-suite time-exts-unit-tests
   default-language:
@@ -58,4 +57,3 @@ test-suite time-exts-unit-tests
   ghc-options:
     -O2
     -Wall
-    -threaded
