@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Grapevine (Grapevine, grapevineKing, grapevineNoble, grapevinePort, grapevineSize, grapevineTable, publish, yell, hear, getStats, putStats, htmlNetStats) where
+module Grapevine (Grapevine, grapevineKing, grapevineNoble,
+  grapevinePort, grapevineSize, grapevineTable,
+  publish, yell, hear, getStats, putStats, htmlNetStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
 import Control.Concurrent hiding (readChan)
-import Control.Concurrent.BoundedChan
+import Control.Concurrent.BoundedChan as BChan
 import Control.Concurrent.Async
 import Control.Exception
 import Control.Monad
@@ -23,7 +25,7 @@ import System.IO
 
 import Kautz
 
-data Message = Hello String | Peerage (M.Map String String) | Blob ByteString deriving (Show, Read)
+data Message = Hello String | Peerage (M.Map String String) deriving (Show, Read)
 
 data Grapevine = Grapevine {
   myNetName :: String,
@@ -34,17 +36,10 @@ data Grapevine = Grapevine {
   peerage :: MVar (M.Map String SockAddr),
   kingHandle :: Maybe Handle,
   mayStart :: MVar (),
-  neighbours :: MVar (M.Map String Handle),
+  neighbours :: MVar (M.Map String (BoundedChan ByteString, Handle)),
   netStats :: MVar (M.Map String Int),
   seenTables :: MVar [Set ByteString]
 }
-
-reuseMyPort :: Grapevine -> IO Socket
-reuseMyPort gv = do
-  outSock <- socket AF_INET Stream 0
-  setSocketOption outSock ReusePort 1
-  bind outSock $ SockAddrInet (myPort gv) iNADDR_ANY
-  pure outSock
 
 newGrapevine :: String -> Int -> IO Grapevine
 newGrapevine name port = do
@@ -96,6 +91,14 @@ grapevineKing name port = do
   void $ forkIO $ kingLoop gv
   pure gv
 
+-- | Open an outbound socket on the same socket we're listening on.
+reuseMyPort :: Grapevine -> IO Socket
+reuseMyPort gv = do
+  outSock <- socket AF_INET Stream 0
+  setSocketOption outSock ReusePort 1
+  bind outSock $ SockAddrInet (myPort gv) iNADDR_ANY
+  pure outSock
+
 grapevineNoble :: String -> String -> Int -> IO Grapevine
 grapevineNoble king name port = do
   let [host, seedPort] = splitOn ":" king
@@ -123,8 +126,7 @@ handshake gv = do
   -- 3. Say OK after meshing.
   wire h "OK"
   -- 4. First block should come from king.
-  Just (Blob b) <- readMay . unpack <$> procure h
-  process gv b
+  process gv =<< procure h
   -- 5. Notify nobleLoop.
   putMVar (mayStart gv) ()
   -- 6. Send stats.
@@ -159,7 +161,9 @@ kingLoop gv = forever $ do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
         ns <- takeMVar $ neighbours gv
-        putMVar (neighbours gv) $ M.insert s h ns
+        ch <- newBoundedChan 5
+        void $ forkIO $ stream s ch h
+        putMVar (neighbours gv) $ M.insert s (ch, h) ns
       _ -> putStrLn "BAD HELLO"
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
@@ -196,7 +200,9 @@ socialize gv = do
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      pure (s, h)
+      ch <- newBoundedChan 20
+      void $ forkIO $ stream s ch h
+      pure (s, (ch, h))
     void $ swapMVar (neighbours gv) $ M.fromList $ concat as
   else if n <= 20 then kautz gv ps 4 1
   else if n <= 30 then kautz gv ps 5 1
@@ -229,7 +235,9 @@ kautz gv ps m n = let
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      pure (s, h)
+      ch <- newBoundedChan 20
+      void $ forkIO $ stream s ch h
+      pure (s, (ch, h))
     void $ swapMVar (neighbours gv) $ M.fromList as
 
 reportSighting :: Ord a => [Set a] -> a -> [Set a]
@@ -238,11 +246,13 @@ reportSighting seens@(a:as) h = if Set.size a == 1024
   else Set.insert h a : as
 reportSighting [] _ = error "BUG!"
 
+-- | Add to a stat counter.
 add :: Grapevine -> Int -> String -> IO ()
 add gv n s = do
   st <- takeMVar $ netStats gv
   putMVar (netStats gv) $! M.insertWith (+) s n st
 
+-- | Incrmeent a stat counter.
 inc :: Grapevine -> String -> IO ()
 inc gv s = add gv 1 s
 
@@ -259,6 +269,12 @@ process gv b = do
     status <- tryWriteChan (blobChan gv) b
     if status then do
       inc gv "inqueue"
+      st <- takeMVar $ netStats gv
+      let
+        st1 = M.insertWith (+) "inqueue" 1 st
+        n = st1 M.! "inqueue"
+      putMVar (netStats gv) $!
+        if n > fromMaybe 0 (M.lookup "inqueue-high-water-mark" st1) then M.insert "inqueue-high-water-mark" n st1 else st1
     else do
       inc gv "indropped"
       putStrLn "FULL BUFFER"
@@ -267,8 +283,8 @@ publish :: Grapevine -> IO ()
 publish gv = do
   ps <- readMVar $ peerage gv
   ns <- readMVar $ neighbours gv
-  forConcurrently_ ns $ \h -> do
-    wire h $ pack $ show $ Peerage $ M.map show ps
+  forConcurrently_ ns $ \(ch, h) -> do
+    BChan.writeChan ch $ pack $ show $ Peerage $ M.map show ps
     bs <- procure h
     when (bs /= "OK") $ ioError $ userError "EXPECT OK"
   print ps
@@ -276,14 +292,22 @@ publish gv = do
 isKing :: Grapevine -> Bool
 isKing gv = isNothing $ kingHandle gv
 
+stream :: String -> BoundedChan ByteString -> Handle -> IO ()
+stream s ch h = forever $ do
+  b <- readChan ch
+  catch (wire h b) $ \e -> do
+    putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+    --ns1 <- takeMVar $ neighbours gv
+    --putMVar (neighbours gv) $ M.delete s ns1
+
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
   then do
     ns <- readMVar $ neighbours gv
     ps <- readMVar $ peerage gv
-    forM_ (M.assocs ns) $ \(s, h) -> void $ forkIO $ do
-      wire h $ pack $ show $ Blob b
-      handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
+    forM_ (M.assocs ns) $ \(s, (ch, h)) -> do
+      BChan.writeChan ch b
+      void $ forkIO $ handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
         stats <- procure h
         status <- tryWriteChan (statsChan gv) (show $ ps M.! s, stats)
         when (not status) $ do
@@ -293,10 +317,9 @@ yell gv b = if isKing gv
     inc gv "out"
     ns <- readMVar $ neighbours gv
     seens <- takeMVar $ seenTables gv
-    forConcurrently_ (M.assocs ns) $ \(s, h) -> catch (wire h b) $ \e -> do
-      putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
-      ns1 <- takeMVar $ neighbours gv
-      putMVar (neighbours gv) $ M.delete s ns1
+    forM_ (M.assocs ns) $ \(s, (ch, _)) -> do
+      roomy <- tryWriteChan ch b
+      when (not roomy) $ putStrLn $ "OUT CHANNEL FULL: " ++ s
     putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
