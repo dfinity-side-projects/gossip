@@ -19,10 +19,7 @@ main = do
       when (n < sz) $ threadDelay 10000 >> waitForSz
   waitForSz
   publish central
-  yell central $ pack "READY"
   forConcurrently_ (zip gvs names) $ \(gv, name) -> do
-    ok <- hear gv
-    when (ok /= "READY") $ putStrLn "EXPECT READY"
     let
       m = pack name
       f ms = if length ms == sz then

@@ -24,7 +24,7 @@ import System.IO
 
 import Kautz
 
-data Message = Hello String | Peerage (M.Map String String) deriving (Show, Read)
+data Message = Hello String | Peerage (M.Map String String) | Predecessor | Blob ByteString deriving (Show, Read)
 
 data Grapevine = Grapevine {
   myNetName :: String,
@@ -34,7 +34,6 @@ data Grapevine = Grapevine {
   statsChan :: BoundedChan (String, ByteString),
   peerage :: MVar (M.Map String SockAddr),
   kingHandle :: Maybe Handle,
-  mayStart :: MVar (),
   neighbours :: MVar (M.Map String (BoundedChan ByteString, Handle)),
   netStats :: MVar (M.Map String Int),
   seenTables :: MVar [Set ByteString]
@@ -54,7 +53,6 @@ newGrapevine name port = do
   emptyNeighbours <- newMVar M.empty
   emptyNetStats <- newMVar M.empty
   emptySeens <- newMVar $ replicate 3 Set.empty
-  notYet <- newEmptyMVar
   pure $ Grapevine {
     myNetName = name,
     myPort = inPort,
@@ -63,7 +61,6 @@ newGrapevine name port = do
     statsChan = sc,
     peerage = emptyPeerage,
     kingHandle = Nothing,
-    mayStart = notYet,
     neighbours = emptyNeighbours,
     netStats = emptyNetStats,
     seenTables = emptySeens
@@ -124,11 +121,7 @@ handshake gv = do
   socialize gv
   -- 3. Say OK after meshing.
   wire h "OK"
-  -- 4. First block should come from king.
-  process gv =<< procure h
-  -- 5. Notify nobleLoop.
-  putMVar (mayStart gv) ()
-  -- 6. Send stats.
+  -- 4. Send stats.
   forever $ do
     (_, bs) <- readChan $ statsChan gv
     wire h bs
@@ -142,11 +135,18 @@ nobleLoop gv = forever $ do
       putStrLn $ "DISCONNECT: " ++ show peer ++ ": " ++ show (e :: SomeException)
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
-    readMVar $ mayStart gv
-    inc gv ("in/" ++ show peer ++ "/connected")
-    handle discon $ forever $ do
-      process gv =<< procure h
-      inc gv ("in/" ++ show peer ++ "/msg")
+    bs <- procure h
+    case readMay $ unpack bs of
+      Just (Blob b) -> do
+        process gv b
+        yell gv b
+      Just Predecessor -> do
+        --readMVar $ mayStart gv
+        inc gv ("in/" ++ show peer ++ "/connected")
+        handle discon $ forever $ do
+          process gv =<< procure h
+          inc gv ("in/" ++ show peer ++ "/msg")
+      _ -> putStrLn "BAD GREETING"
 
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = forever $ do
@@ -159,7 +159,12 @@ kingLoop gv = forever $ do
       Just (Hello s) -> do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
-        void $ forkIO $ stream gv s h
+        -- TODO: The following channel is unused. Perhaps we should
+        -- have a King-specific neighbour handles list.
+        -- After the first block, the King's only job is to collect stats.
+        ch <- newBoundedChan 1
+        ns <- takeMVar $ neighbours gv
+        putMVar (neighbours gv) $ M.insert s (ch, h) ns
       _ -> putStrLn "BAD HELLO"
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
@@ -272,10 +277,31 @@ publish :: Grapevine -> IO ()
 publish gv = do
   ps <- readMVar $ peerage gv
   ns <- readMVar $ neighbours gv
-  forM_ ns $ \(ch, h) -> do
-    BChan.writeChan ch $ pack $ show $ Peerage $ M.map show ps
+  meshedV <- newEmptyMVar
+  doneV <- newEmptyMVar
+  let
+    waitFor 0 = putMVar meshedV ()
+    waitFor n = do
+      takeMVar doneV
+      waitFor $ n - 1
+  void $ forkIO $ waitFor $ M.size ns
+  -- Give every noble the Peerage, then wait for each to connect to their
+  -- successors.
+  forM_ ns $ \(_, h) -> void $ forkIO $ do
+    wire h $ pack $ show $ Peerage $ M.map show ps
     bs <- procure h
     when (bs /= "OK") $ ioError $ userError "EXPECT OK"
+    putMVar doneV ()
+  -- Only continue once all are ready.
+  takeMVar meshedV
+  -- Listen to stats.
+  forM_ (M.assocs ns) $ \(s, (_, h)) -> void $ forkIO $ do
+    handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
+      stats <- procure h
+      status <- tryWriteChan (statsChan gv) (show $ ps M.! s, stats)
+      when (not status) $ do
+        inc gv "statsdrop"
+        putStrLn "king: STATS DROPPED"
 
 isKing :: Grapevine -> Bool
 isKing gv = isNothing $ kingHandle gv
@@ -285,6 +311,7 @@ stream gv s h = do
   ch <- newBoundedChan 128
   ns <- takeMVar $ neighbours gv
   putMVar (neighbours gv) $ M.insert s (ch, h) ns
+  wire h $ pack $ show Predecessor
   catch (forever $ do
     b <- readChan ch
     wire h b) $ \e -> do
@@ -295,16 +322,11 @@ stream gv s h = do
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
   then do
-    ns <- readMVar $ neighbours gv
     ps <- readMVar $ peerage gv
-    forM_ (M.assocs ns) $ \(s, (ch, h)) -> do
-      BChan.writeChan ch b
-      void $ forkIO $ handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
-        stats <- procure h
-        status <- tryWriteChan (statsChan gv) (show $ ps M.! s, stats)
-        when (not status) $ do
-          inc gv "statsdrop"
-          putStrLn "king: STATS DROPPED"
+    tmp <- socket AF_INET Stream 0
+    connect tmp $ snd $ M.findMin ps
+    h <- socketToHandle tmp WriteMode
+    wire h $ pack $ show $ Blob b
   else do
     inc gv "out"
     ns <- readMVar $ neighbours gv

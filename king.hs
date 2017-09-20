@@ -8,4 +8,3 @@ main = do
   putStrLn "Press Enter to publish peerage."
   void $ getLine
   publish gv
-  yell gv $ pack "GO"
