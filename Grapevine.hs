@@ -7,7 +7,6 @@ import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
 import Control.Concurrent hiding (readChan)
 import Control.Concurrent.BoundedChan as BChan
-import Control.Concurrent.Async
 import Control.Exception
 import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -160,10 +159,7 @@ kingLoop gv = forever $ do
       Just (Hello s) -> do
         ps <- takeMVar $ peerage gv
         putMVar (peerage gv) $ M.insert s peer ps
-        ns <- takeMVar $ neighbours gv
-        ch <- newBoundedChan 5
-        void $ forkIO $ stream s ch h
-        putMVar (neighbours gv) $ M.insert s (ch, h) ns
+        void $ forkIO $ stream gv s h
       _ -> putStrLn "BAD HELLO"
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
@@ -195,15 +191,11 @@ socialize :: Grapevine -> IO ()
 socialize gv = do
   ps <- readMVar $ peerage gv
   let n = M.size ps
-  if n < 10 then do
-    as <- forConcurrently (M.assocs ps) $ \(s, sock) -> if s == myNetName gv then pure [] else pure <$> do
-      tmp <- socket AF_INET Stream 0
-      connect tmp sock
-      h <- socketToHandle tmp ReadWriteMode
-      ch <- newBoundedChan 20
-      void $ forkIO $ stream s ch h
-      pure (s, (ch, h))
-    void $ swapMVar (neighbours gv) $ M.fromList $ concat as
+  if n < 10 then forM_ (M.assocs ps) $ \(s, sock) -> when (s /= myNetName gv) $ do
+    tmp <- socket AF_INET Stream 0
+    connect tmp sock
+    h <- socketToHandle tmp ReadWriteMode
+    void $ forkIO $ stream gv s h
   else if n <= 20 then kautz gv ps 4 1
   else if n <= 30 then kautz gv ps 5 1
   else if n <= 42 then kautz gv ps 6 1
@@ -231,14 +223,11 @@ kautz gv ps m n = let
   os = filter (/= i) $ nub $ (`mod` lim) <$> (kautzOut m n i ++ if lim + i < sz then kautzOut m n (lim + i) else [])
   in do
     when (sz > lim * 2) $ ioError $ userError "BUG! Kautz graph too big!"
-    as <- forConcurrently ((`M.elemAt` ps) <$> os) $ \(s, sock) -> do
+    forM_ ((`M.elemAt` ps) <$> os) $ \(s, sock) -> do
       tmp <- socket AF_INET Stream 0
       connect tmp sock
       h <- socketToHandle tmp ReadWriteMode
-      ch <- newBoundedChan 20
-      void $ forkIO $ stream s ch h
-      pure (s, (ch, h))
-    void $ swapMVar (neighbours gv) $ M.fromList as
+      void $ forkIO $ stream gv s h
 
 reportSighting :: Ord a => [Set a] -> a -> [Set a]
 reportSighting seens@(a:as) h = if Set.size a == 1024
@@ -283,22 +272,25 @@ publish :: Grapevine -> IO ()
 publish gv = do
   ps <- readMVar $ peerage gv
   ns <- readMVar $ neighbours gv
-  forConcurrently_ ns $ \(ch, h) -> do
+  forM_ ns $ \(ch, h) -> do
     BChan.writeChan ch $ pack $ show $ Peerage $ M.map show ps
     bs <- procure h
     when (bs /= "OK") $ ioError $ userError "EXPECT OK"
-  print ps
 
 isKing :: Grapevine -> Bool
 isKing gv = isNothing $ kingHandle gv
 
-stream :: String -> BoundedChan ByteString -> Handle -> IO ()
-stream s ch h = forever $ do
-  b <- readChan ch
-  catch (wire h b) $ \e -> do
-    putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
-    --ns1 <- takeMVar $ neighbours gv
-    --putMVar (neighbours gv) $ M.delete s ns1
+stream :: Grapevine -> String -> Handle -> IO ()
+stream gv s h = do
+  ch <- newBoundedChan 128
+  ns <- takeMVar $ neighbours gv
+  putMVar (neighbours gv) $ M.insert s (ch, h) ns
+  catch (forever $ do
+    b <- readChan ch
+    wire h b) $ \e -> do
+      putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+      ns1 <- takeMVar $ neighbours gv
+      putMVar (neighbours gv) $ M.delete s ns1
 
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
@@ -320,6 +312,7 @@ yell gv b = if isKing gv
     forM_ (M.assocs ns) $ \(s, (ch, _)) -> do
       roomy <- tryWriteChan ch b
       when (not roomy) $ putStrLn $ "OUT CHANNEL FULL: " ++ s
+      BChan.writeChan ch b
     putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
