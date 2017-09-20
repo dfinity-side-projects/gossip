@@ -141,7 +141,6 @@ nobleLoop gv = forever $ do
         process gv b
         yell gv b
       Just Predecessor -> do
-        --readMVar $ mayStart gv
         inc gv ("in/" ++ show peer ++ "/connected")
         handle discon $ forever $ do
           process gv =<< procure h
@@ -176,7 +175,7 @@ readPeerage m = Just $ M.map f m where
 wire :: Handle -> ByteString -> IO ()
 wire h s = do
   let n = B.length s
-  when (n > 2 * 1024 * 1024) $ ioError $ userError "wire: artifact too large!"
+  when (n > 5 * 1024 * 1024) $ ioError $ userError "wire: artifact too large!"
   let ds = map (chr . (`mod` 256) . div n) $ (256^) <$> [3, 2, 1, 0 :: Int]
   forM_ ds $ hPutChar h
   B.hPut h s
@@ -187,7 +186,7 @@ procure h = do
   ds <- unpack <$> B.hGet h 4
   when (null ds) $ ioError $ userError $ "handle closed"
   let n = sum $ zipWith (*) (ord <$> ds) $ (256^) <$> [3, 2, 1, 0 :: Int]
-  when (n > 2 * 1024 * 1024) $ ioError $ userError $ "BUG! Artifact too large: " ++ show n
+  when (n > 5 * 1024 * 1024) $ ioError $ userError $ "BUG! Artifact too large: " ++ show n
   r <- B.hGet h n
   when (B.null r) $ ioError $ userError $ "handle closed"
   pure r
@@ -262,7 +261,6 @@ process gv b = do
     putMVar (seenTables gv) $ reportSighting seens h
     status <- tryWriteChan (blobChan gv) b
     if status then do
-      inc gv "inqueue"
       st <- takeMVar $ netStats gv
       let
         st1 = M.insertWith (+) "inqueue" 1 st
