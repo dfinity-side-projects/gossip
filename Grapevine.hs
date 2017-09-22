@@ -12,7 +12,6 @@ import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
 import Data.Char
 import Data.IP
-import Data.List
 import Data.List.Split
 import qualified Data.Map.Strict as M
 import Data.Maybe
@@ -24,7 +23,8 @@ import System.IO
 
 import Kautz
 
-data Message = Hello String | Peerage (M.Map String String) | Predecessor | Blob ByteString deriving (Show, Read)
+data Message = Hello String | Peerage Bool (M.Map String String)
+  | Predecessor | Successor String | Edict ByteString deriving (Show, Read)
 
 data Grapevine = Grapevine {
   myNetName :: String,
@@ -36,7 +36,8 @@ data Grapevine = Grapevine {
   kingHandle :: Maybe Handle,
   neighbours :: MVar (M.Map String (BoundedChan ByteString, Handle)),
   netStats :: MVar (M.Map String Int),
-  seenTables :: MVar [Set ByteString]
+  seenTables :: MVar [Set ByteString],
+  isMeshed :: MVar Bool
 }
 
 newGrapevine :: String -> Int -> IO Grapevine
@@ -53,6 +54,7 @@ newGrapevine name port = do
   emptyNeighbours <- newMVar M.empty
   emptyNetStats <- newMVar M.empty
   emptySeens <- newMVar $ replicate 3 Set.empty
+  meshedFalse <- newMVar False
   pure $ Grapevine {
     myNetName = name,
     myPort = inPort,
@@ -63,7 +65,8 @@ newGrapevine name port = do
     kingHandle = Nothing,
     neighbours = emptyNeighbours,
     netStats = emptyNetStats,
-    seenTables = emptySeens
+    seenTables = emptySeens,
+    isMeshed = meshedFalse
   }
 
 putStats :: Grapevine -> ByteString -> IO ()
@@ -105,47 +108,54 @@ grapevineNoble king name port = do
   h <- socketToHandle outSock ReadWriteMode
   let gv = gv0 { kingHandle = Just h }
   void $ forkIO $ nobleLoop gv
-  void $ forkIO $ handshake gv
+  void $ forkIO $ handshake gv h
   pure gv
 
-handshake :: Grapevine -> IO ()
-handshake gv = do
-  let Just h = kingHandle gv
+handshake :: Grapevine -> Handle -> IO ()
+handshake gv h = do
   -- 1. Say Hello.
   wire h $ pack $ show $ Hello $ myNetName gv
   -- 2. Read Peerage.
-  Just (Peerage m) <- readMay . unpack <$> procure h
+  Just (Peerage meshed m) <- readMay . unpack <$> procure h
   let Just ps = readPeerage m
   void $ swapMVar (peerage gv) ps
   print =<< readMVar (peerage gv)
+  void $ swapMVar (isMeshed gv) meshed
   socialize gv
   -- 3. Say OK after meshing.
   wire h "OK"
   -- 4. Send stats.
-  forever $ do
-    (_, bs) <- readChan $ statsChan gv
-    wire h bs
+  forever $ wire h . snd =<< readChan (statsChan gv)
+
+-- | Slurp messages from a handle.
+-- Counterpart to `stream`.
+slurp :: Grapevine -> SockAddr -> Handle -> IO ()
+slurp gv peer h = do
+  let
+    discon e = do
+      add gv (-1) ("in/" ++ show peer ++ "/connected")
+      putStrLn $ "DISCONNECT: " ++ show peer ++ ": " ++ show (e :: SomeException)
+  inc gv ("in/" ++ show peer ++ "/connected")
+  handle discon $ forever $ do
+    process gv =<< procure h
+    inc gv ("in/" ++ show peer ++ "/msg")
 
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = forever $ do
   (sock, peer) <- accept $ mySock gv
-  let
-    discon e = do
-      add gv (-1) ("in/" ++ show sock ++ "/connected")
-      putStrLn $ "DISCONNECT: " ++ show peer ++ ": " ++ show (e :: SomeException)
   void $ forkIO $ do
     h <- socketToHandle sock ReadWriteMode
     bs <- procure h
     case readMay $ unpack bs of
-      Just (Blob b) -> do
+      Just (Edict b) -> do  -- Only King sends these.
         process gv b
         yell gv b
-      Just Predecessor -> do
-        inc gv ("in/" ++ show peer ++ "/connected")
-        handle discon $ forever $ do
-          process gv =<< procure h
-          inc gv ("in/" ++ show peer ++ "/msg")
+      Just Predecessor -> slurp gv peer h
+      Just (Successor s) -> do
+        putStrLn $ "SUCCESSOR RECONNECT: " ++ show peer
+        stream gv s h
       _ -> putStrLn "BAD GREETING"
+    hClose h
 
 kingLoop :: Grapevine -> IO ()
 kingLoop gv = forever $ do
@@ -164,7 +174,16 @@ kingLoop gv = forever $ do
         ch <- newBoundedChan 1
         ns <- takeMVar $ neighbours gv
         putMVar (neighbours gv) $ M.insert s (ch, h) ns
+        alreadyMeshed <- readMVar $ isMeshed gv
+        when (alreadyMeshed) $ sendAlreadyMeshedPeerage gv h
       _ -> putStrLn "BAD HELLO"
+
+sendAlreadyMeshedPeerage :: Grapevine -> Handle -> IO ()
+sendAlreadyMeshedPeerage gv h = do
+  ps <- readMVar $ peerage gv
+  wire h $ pack $ show $ Peerage True $ M.map show ps
+  bs <- procure h
+  when (bs /= "OK") $ ioError $ userError "EXPECT OK"
 
 readPeerage :: M.Map String String -> Maybe (M.Map String SockAddr)
 readPeerage m = Just $ M.map f m where
@@ -191,47 +210,45 @@ procure h = do
   when (B.null r) $ ioError $ userError $ "handle closed"
   pure r
 
+-- | Connect to direct successors.
+outConnect :: Grapevine -> [(String, SockAddr)] -> IO ()
+outConnect gv succs = forM_ succs $ \(s, sock) -> do
+  tmp <- socket AF_INET Stream 0
+  connect tmp sock
+  h <- socketToHandle tmp ReadWriteMode
+  void $ forkIO $ stream gv s h
+
+-- | If already meshed, tell direct predecesors we're back online.
+inConnect :: Grapevine -> [(String, SockAddr)] -> IO ()
+inConnect gv preds = (readMVar (isMeshed gv) >>=) $ flip when $
+  forM_ preds $ \(_, sock) -> void $ forkIO $ do
+    tmp <- socket AF_INET Stream 0
+    connect tmp sock
+    h <- socketToHandle tmp ReadWriteMode
+    wire h $ pack $ show $ Successor $ myNetName gv
+    bs <- procure h
+    case readMay $ unpack bs of
+      Just Predecessor -> slurp gv sock h
+      _ -> ioError $ userError "WANT REPLY: 'Predecessor'"
+
 socialize :: Grapevine -> IO ()
 socialize gv = do
   ps <- readMVar $ peerage gv
   let n = M.size ps
-  if n < 10 then forM_ (M.assocs ps) $ \(s, sock) -> when (s /= myNetName gv) $ do
-    tmp <- socket AF_INET Stream 0
-    connect tmp sock
-    h <- socketToHandle tmp ReadWriteMode
-    void $ forkIO $ stream gv s h
-  else if n <= 20 then kautz gv ps 4 1
-  else if n <= 30 then kautz gv ps 5 1
-  else if n <= 42 then kautz gv ps 6 1
-  else if n <= 80 then kautz gv ps 4 2
-  else if n <= 108 then kautz gv ps 3 3
-  else if n <= 150 then kautz gv ps 5 2
-  else if n <= 252 then kautz gv ps 6 2
-  else if n <= 320 then kautz gv ps 4 3
-  else if n <= 392 then kautz gv ps 7 2
-  else if n <= 750 then kautz gv ps 5 3
-  else if n <= 972 then kautz gv ps 3 5
-  --else if n <= 1100 then kautz gv ps 10 2
-  else if n <= 1512 then kautz gv ps 6 3
-  else if n <= 2744 then kautz gv ps 7 3
-  else if n <= 4608 then kautz gv ps 8 3
-  else if n <= 7290 then kautz gv ps 9 3
-  else if n <= 11000 then kautz gv ps 10 3
-  else undefined
+  if n < 10 then do
+    let others = filter ((/= myNetName gv) . fst) $ M.assocs ps
+    outConnect gv others
+    inConnect  gv others
+  else kautz gv ps $ kautzRecommend n
 
-kautz :: Grapevine -> M.Map String SockAddr -> Int -> Int -> IO ()
-kautz gv ps m n = let
-  sz = (m + 1)*m^n
+kautz :: Grapevine -> M.Map String SockAddr -> (Int, Int) -> IO ()
+kautz gv ps (m, n) = let
+  sz = kautzSize m n
   lim = M.size ps
   i = M.findIndex (myNetName gv) ps
-  os = filter (/= i) $ nub $ (`mod` lim) <$> (kautzOut m n i ++ if lim + i < sz then kautzOut m n (lim + i) else [])
-  in do
-    when (sz > lim * 2) $ ioError $ userError "BUG! Kautz graph too big!"
-    forM_ ((`M.elemAt` ps) <$> os) $ \(s, sock) -> do
-      tmp <- socket AF_INET Stream 0
-      connect tmp sock
-      h <- socketToHandle tmp ReadWriteMode
-      void $ forkIO $ stream gv s h
+  in assert (sz >= lim) $ assert (sz <= lim * 2) $ do
+    outConnect gv $ (`M.elemAt` ps) <$> kautzOutRoomy m n i lim
+    inConnect  gv $ (`M.elemAt` ps) <$> kautzInRoomy  m n i lim
 
 reportSighting :: Ord a => [Set a] -> a -> [Set a]
 reportSighting seens@(a:as) h = if Set.size a == 1024
@@ -258,7 +275,7 @@ process gv b = do
     putMVar (seenTables gv) seens
   else do
     inc gv "in"
-    putMVar (seenTables gv) $ reportSighting seens h
+    putMVar (seenTables gv) $! reportSighting seens h
     status <- tryWriteChan (blobChan gv) b
     if status then do
       st <- takeMVar $ netStats gv
@@ -275,10 +292,10 @@ publish :: Grapevine -> IO ()
 publish gv = do
   ps <- readMVar $ peerage gv
   ns <- readMVar $ neighbours gv
-  meshedV <- newEmptyMVar
+  void $ takeMVar $ isMeshed gv
   doneV <- newEmptyMVar
   let
-    waitFor 0 = putMVar meshedV ()
+    waitFor 0 = putMVar (isMeshed gv) True
     waitFor n = do
       takeMVar doneV
       waitFor $ n - 1
@@ -286,15 +303,19 @@ publish gv = do
   -- Give every noble the Peerage, then wait for each to connect to their
   -- successors.
   forM_ ns $ \(_, h) -> void $ forkIO $ do
-    wire h $ pack $ show $ Peerage $ M.map show ps
+    wire h $ pack $ show $ Peerage False $ M.map show ps
     bs <- procure h
     when (bs /= "OK") $ ioError $ userError "EXPECT OK"
     putMVar doneV ()
   -- Only continue once all are ready.
-  takeMVar meshedV
+  void $ readMVar $ isMeshed gv
   -- Listen to stats.
   forM_ (M.assocs ns) $ \(s, (_, h)) -> void $ forkIO $ do
-    handle (\e -> putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)) $ forever $ do
+    let
+      discon e = do
+        putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+        hClose h
+    handle discon $ forever $ do
       stats <- procure h
       status <- tryWriteChan (statsChan gv) (show $ ps M.! s, stats)
       when (not status) $ do
@@ -304,18 +325,19 @@ publish gv = do
 isKing :: Grapevine -> Bool
 isKing gv = isNothing $ kingHandle gv
 
+-- | Blast messages to a handle.
+-- Counterpart to `slurp`.
 stream :: Grapevine -> String -> Handle -> IO ()
 stream gv s h = do
   ch <- newBoundedChan 128
   ns <- takeMVar $ neighbours gv
   putMVar (neighbours gv) $ M.insert s (ch, h) ns
   wire h $ pack $ show Predecessor
-  catch (forever $ do
-    b <- readChan ch
-    wire h b) $ \e -> do
-      putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
-      ns1 <- takeMVar $ neighbours gv
-      putMVar (neighbours gv) $ M.delete s ns1
+  catch (forever $ readChan ch >>= wire h) $ \e -> do
+    putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+    ns1 <- takeMVar $ neighbours gv
+    putMVar (neighbours gv) $ M.delete s ns1
+    hClose h
 
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isKing gv
@@ -324,7 +346,8 @@ yell gv b = if isKing gv
     tmp <- socket AF_INET Stream 0
     connect tmp $ snd $ M.findMin ps
     h <- socketToHandle tmp WriteMode
-    wire h $ pack $ show $ Blob b
+    wire h $ pack $ show $ Edict b
+    hClose h
   else do
     inc gv "out"
     ns <- readMVar $ neighbours gv
@@ -333,7 +356,7 @@ yell gv b = if isKing gv
       roomy <- tryWriteChan ch b
       when (not roomy) $ putStrLn $ "OUT CHANNEL FULL: " ++ s
       BChan.writeChan ch b
-    putMVar (seenTables gv) $ reportSighting seens $ SHA256.hash b
+    putMVar (seenTables gv) $! reportSighting seens $ SHA256.hash b
 
 hear :: Grapevine -> IO ByteString
 hear gv = do
@@ -348,7 +371,7 @@ htmlNetStats gv = do
   t <- readMVar $ netStats gv
   pure $ concat
     [ "out-neighbours:\n"
-    , (unlines $ map show $ catMaybes $ (`M.lookup` ps) <$> (M.keys ns)) ++ "\n"
+    , (unlines $ map show $ catMaybes $ (`M.lookup` ps) <$> M.keys ns) ++ "\n"
     , unlines $ show <$> M.assocs t
     ]
 
