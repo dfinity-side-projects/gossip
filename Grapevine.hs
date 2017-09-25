@@ -19,7 +19,9 @@ import qualified Data.Set as S
 import Data.Set (Set)
 import Network.Socket hiding (send, recv)
 import Safe
+import System.Clock
 import System.IO
+import Text.Printf
 
 import Kautz
 
@@ -350,10 +352,21 @@ stream gv s h = do
   ch <- newBoundedChan 128
   modifyMVar_ (sucs gv) $ pure . M.insert s (ch, h)
   wire h $ pack $ show (Predecessor $ fromJust $ myNetName gv)
-  catch (forever $ readChan ch >>= wire h) $ \e -> do
-    putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
-    modifyMVar_ (sucs gv) $ pure . M.delete s
-    hClose h
+  let
+    discon e = do
+      putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
+      modifyMVar_ (sucs gv) $ pure . M.delete s
+      hClose h
+  handle discon $ forever $ do
+    b <- readChan ch
+    {-
+    t <- getTime Realtime
+    let
+      s = show $ B.length b
+      msg = concat [show $ sec t, ".", printf "%06d" $ nsec t `div` 1000, ": ", s]
+    putStrLn msg
+    -}
+    wire h b
 
 yell :: Grapevine -> ByteString -> IO ()
 yell gv b = if isNothing $ myNetName gv then do
