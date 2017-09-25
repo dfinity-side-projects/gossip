@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Grapevine (Grapevine, grapevineKing, grapevineNoble,
   grapevinePort, grapevineSize, grapevineTable,
-  publish, yell, hear, getStats, putStats, htmlNetStats) where
+  publish, yell, hear, getPeerage, getStats, putStats, htmlNetStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -19,9 +19,7 @@ import qualified Data.Set as S
 import Data.Set (Set)
 import Network.Socket hiding (send, recv)
 import Safe
-import System.Clock
 import System.IO
-import Text.Printf
 
 import Kautz
 
@@ -75,6 +73,9 @@ newGrapevine name port = do
     seenTables = emptySeens,
     isMeshed = meshedFalse
   }
+
+getPeerage :: Grapevine -> IO (M.Map String SockAddr)
+getPeerage = readMVar . peerage
 
 putStats :: Grapevine -> ByteString -> IO ()
 putStats gv stats = do
