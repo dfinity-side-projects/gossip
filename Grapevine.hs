@@ -213,7 +213,7 @@ outConnect gv succs = forM_ succs $ \(s, sock) -> do
   -- connect, and stream to them if the link is meant to be bidirectional.
   --
   --  * Once we receive the Peerage, some scheme determines who initiates a
-  -- bidrectional connection. For outgoig connections, this just means we
+  -- bidrectional connection. For outgoing connections, this just means we
   -- might also have to slurp the handle. Meanwhile, in the accept loop, we
   -- use MVars so that we stream to existing certain incoming connections but
   -- also set up bidirectional links when handling new ones.
