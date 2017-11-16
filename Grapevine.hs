@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Grapevine (Grapevine, grapevineKing, grapevineNoble,
   grapevinePort, grapevineSize, grapevineTable,
-  publish, yell, hear, getPeerage, getStats, putStats, htmlNetStats) where
+  publish, yell, hear, getPeerage, htmlNetStats) where
 
 import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
@@ -32,7 +32,6 @@ data Grapevine = Grapevine {
   myPort :: PortNumber,
   mySock :: Socket,
   blobCh :: BoundedChan ByteString,
-  statsCh :: BoundedChan (String, ByteString),
   peerage :: MVar (M.Map String SockAddr),
   subjects :: MVar (M.Map String Handle),
   pres :: MVar (S.Set String),
@@ -51,7 +50,6 @@ newGrapevine name port = do
   listen inSock 128
   inPort <- socketPort inSock
   bc <- newBoundedChan 16384
-  sc <- newBoundedChan 64
   emptyPeerage <- newMVar M.empty
   noSubjects <- newEmptyMVar
   emptyPres <- newMVar S.empty
@@ -64,7 +62,6 @@ newGrapevine name port = do
     myPort = inPort,
     mySock = inSock,
     blobCh = bc,
-    statsCh = sc,
     peerage = emptyPeerage,
     subjects = noSubjects,
     pres = emptyPres,
@@ -76,14 +73,6 @@ newGrapevine name port = do
 
 getPeerage :: Grapevine -> IO (M.Map String SockAddr)
 getPeerage = readMVar . peerage
-
-putStats :: Grapevine -> ByteString -> IO ()
-putStats gv stats = do
-  status <- tryWriteChan (statsCh gv) ("", stats)
-  when (not status) $ putStrLn "channel full: STATS DROPPED"
-
-getStats :: Grapevine -> IO (String, ByteString)
-getStats = readChan . statsCh
 
 grapevineSize :: Grapevine -> IO Int
 grapevineSize gv = M.size <$> readMVar (peerage gv)
@@ -133,8 +122,8 @@ handshake gv h = do
   socialize gv
   -- 3. Say OK after meshing.
   wire h "OK"
-  -- 4. Send stats.
-  forever $ wire h . snd =<< readChan (statsCh gv)
+  -- 4. Close connection.
+  hClose h
 
 nobleLoop :: Grapevine -> IO ()
 nobleLoop gv = forever $ do
@@ -314,20 +303,8 @@ publish gv = do
     bs <- procure h
     when (bs /= "OK") $ ioError $ userError "EXPECT OK"
     putMVar doneV ()
-  -- Only continue once all are ready.
+  -- Wait until all are ready.
   void $ readMVar $ isMeshed gv
-  -- Listen to stats.
-  forM_ (M.assocs ss) $ \(s, h) -> void $ forkIO $ do
-    let
-      discon e = do
-        putStrLn $ "DISCONNECT: " ++ s ++ ": " ++ show (e :: SomeException)
-        hClose h
-    handle discon $ forever $ do
-      stats <- procure h
-      status <- tryWriteChan (statsCh gv) (show $ ps M.! s, stats)
-      when (not status) $ do
-        inc gv "statsdrop"
-        putStrLn "king: STATS DROPPED"
 
 -- | Slurp messages from a handle.
 -- Counterpart to `stream`.
@@ -360,13 +337,6 @@ stream gv s h = do
       hClose h
   handle discon $ forever $ do
     b <- readChan ch
-    {-
-    t <- getTime Realtime
-    let
-      s = show $ B.length b
-      msg = concat [show $ sec t, ".", printf "%06d" $ nsec t `div` 1000, ": ", s]
-    putStrLn msg
-    -}
     wire h b
 
 yell :: Grapevine -> ByteString -> IO ()
