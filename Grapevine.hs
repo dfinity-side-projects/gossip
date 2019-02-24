@@ -101,7 +101,9 @@ grapevineNoble :: String -> String -> Int -> IO Grapevine
 grapevineNoble king name port = do
   let [host, seedPort] = splitOn ":" king
   gv <- newGrapevine (Just name) port
-  addrInfo <- getAddrInfo Nothing (Just host) (Just seedPort)
+  addrInfo <- getAddrInfo (Just (defaultHints { addrFamily=AF_INET }))
+                (Just host)
+                (Just seedPort)
   outSock <- reuseMyPort gv
   connect outSock (addrAddress $ head addrInfo)
   h <- socketToHandle outSock ReadWriteMode

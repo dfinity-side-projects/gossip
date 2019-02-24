@@ -57,3 +57,27 @@ test-suite kautz-unit-tests
   ghc-options:
     -O2
     -Wall
+
+executable example
+  default-language:
+    Haskell2010
+  main-is:
+    example.hs
+  other-modules:
+    Grapevine
+    Kautz
+  build-depends:
+    BoundedChan,
+    async,
+    base,
+    bytestring,
+    containers,
+    cryptohash,
+    iproute,
+    network,
+    safe,
+    split
+  ghc-options:
+    -O2
+    -Wall
+
