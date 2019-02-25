@@ -11,7 +11,7 @@ main = do
   let
     sz = 32
     names = show <$> [1..sz]
-  central <- grapevineKing "CENTRAL" 0
+  central <- grapevineKing 0
   gvs <- forConcurrently names $ \name -> grapevineNoble ("localhost:" ++ show (grapevinePort central)) name 0
   let
     waitForSz = do
